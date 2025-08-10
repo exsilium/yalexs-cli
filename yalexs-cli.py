@@ -16,8 +16,7 @@ Usage (seed tokens from Home Assistant, then operate):
   ./yalexs-cli.py offline-keys --brand YALE_GLOBAL <LOCK_ID>
 
 Config/Cache files:
-  ~/.config/yalexs-cli/oauth_settings.json
-  ~/.config/yalexs-cli/tokens.json
+  ~/.config/yalexs-cli/settings.json
 """
 
 import argparse
@@ -57,49 +56,17 @@ def _config_dir() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "yalexs-cli"
 
 CFG_DIR = _config_dir()
-TOKENS_PATH = CFG_DIR / "tokens.json"
-SETTINGS_PATH = CFG_DIR / "oauth_settings.json"
+SETTINGS_PATH = CFG_DIR / "settings.json"  # <--- single file now
 
 def _ensure_dirs():
     CFG_DIR.mkdir(parents=True, exist_ok=True)
-
-def _jout(obj):
-    sys.stdout.write(json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n")
-    sys.stdout.flush()
-
-def _ok(data):
-    _jout({"ok": True, "data": data})
-    sys.exit(0)
-
-def _fail(code: str, message: str):
-    _jout({"ok": False, "error": {"code": code, "message": message}})
-    sys.exit(1)
-
-def _tokens_path():
-    return Path(os.path.expanduser("~/.config/yalexs-cli/tokens.json"))
-
-def _oauth_settings_path():
-    return Path(os.path.expanduser("~/.config/yalexs-cli/oauth_settings.json"))
-
-# =================== Settings & Tokens ===================
-
-def _default_settings() -> Dict:
-    # Defaults match Yale Global cloud
-    return {
-        "brand": "YALE_GLOBAL",
-        "token_url": "https://oauth.aaecosystem.com/oauth2/token",
-        "authorize_url": "https://oauth.aaecosystem.com/authorization",
-        "scope": "openid profile email offline_access",
-        # client_id is optional for refresh on many providers; store it if you have it
-        # "client_id": "..."
-    }
 
 def _load_settings() -> Dict:
     try:
         data = json.loads(SETTINGS_PATH.read_text())
         # Backfill missing defaults
         base = _default_settings()
-        base.update(data)
+        base.update(data.get("settings", {}))
         return base
     except FileNotFoundError:
         return _default_settings()
@@ -107,7 +74,13 @@ def _load_settings() -> Dict:
         _fail("SETTINGS_READ_FAILED", str(e))
 
 def _save_settings(d: Dict):
-    SETTINGS_PATH.write_text(json.dumps(d, indent=2))
+    # Load existing file if present, preserve tokens
+    try:
+        data = json.loads(SETTINGS_PATH.read_text())
+    except Exception:
+        data = {}
+    data["settings"] = d
+    SETTINGS_PATH.write_text(json.dumps(data, indent=2))
 
 @dataclass
 class Tokens:
@@ -119,14 +92,24 @@ class Tokens:
 
 def _load_tokens() -> Tokens:
     try:
-        return Tokens(**json.loads(TOKENS_PATH.read_text()))
+        data = json.loads(SETTINGS_PATH.read_text())
+        tokens = data.get("tokens")
+        if not tokens:
+            _fail("NO_TOKENS", "No tokens stored. Run 'auth seed' first.")
+        return Tokens(**tokens)
     except FileNotFoundError:
         _fail("NO_TOKENS", "No tokens stored. Run 'auth seed' first.")
     except Exception as e:
         _fail("TOKENS_READ_FAILED", str(e))
 
 def _save_tokens(t: Tokens):
-    TOKENS_PATH.write_text(json.dumps(asdict(t), indent=2))
+    # Load existing file if present, preserve settings
+    try:
+        data = json.loads(SETTINGS_PATH.read_text())
+    except Exception:
+        data = {}
+    data["tokens"] = asdict(t)
+    SETTINGS_PATH.write_text(json.dumps(data, indent=2))
 
 def _brand_from(s: Optional[str]) -> Brand:
     val = (s or _load_settings().get("brand") or "YALE_GLOBAL").upper()
@@ -135,6 +118,16 @@ def _brand_from(s: Optional[str]) -> Brand:
     except Exception:
         _fail("BAD_BRAND", f"Unknown brand '{val}'. Try YALE_GLOBAL or AUGUST.")
         raise
+
+def _default_settings() -> Dict:
+    # Defaults match Yale Global cloud
+    return {
+        "brand": "YALE_GLOBAL",
+        "token_url": "https://oauth.aaecosystem.com/oauth2/token",
+        "authorize_url": "https://oauth.aaecosystem.com/authorization",
+        "scope": "openid profile email offline_access",
+        # "client_id": "...",  # Optional, can be set later
+    }
 
 # =================== Auth commands ===================
 
@@ -162,7 +155,7 @@ async def cmd_auth_seed(args):
         scope=settings.get("scope"),
     )
     _save_tokens(tokens)
-    _ok({"seeded": True, "tokens_path": str(TOKENS_PATH), "settings_path": str(SETTINGS_PATH)})
+    _ok({"seeded": True, "settings_path": str(SETTINGS_PATH)})
 
 async def _refresh_if_needed():
     """
@@ -386,6 +379,8 @@ def _build_parser():
     seed.add_argument("--refresh", required=True, help="Refresh token")
     seed.add_argument("--expires-at", type=float, help="Access token expiry (epoch seconds)")
     seed.add_argument("--brand", default="YALE_GLOBAL", help="Brand (YALE_GLOBAL/AUGUST). Default YALE_GLOBAL")
+    seed.add_argument("--token-url", default=None, help="OAuth token endpoint URL")
+    seed.add_argument("--client-id", default=None, help="OAuth client_id")
     seed.set_defaults(func=cmd_auth_seed)
 
     # -------------------------
@@ -411,6 +406,14 @@ def _build_parser():
     # -------------------------
 
     return p
+
+def _ok(obj):
+    print(json.dumps(obj, indent=2))
+    sys.exit(0)
+
+def _fail(code, msg):
+    print(json.dumps({"error": code, "message": msg}), file=sys.stderr)
+    sys.exit(1)
 
 def main():
     _ensure_dirs()
