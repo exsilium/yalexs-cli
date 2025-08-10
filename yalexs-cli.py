@@ -354,7 +354,28 @@ async def cmd_offline_keys(args):
         if offline_keys is None:
             _fail("NO_OFFLINE_KEYS", "No offline keys found for this lock")
 
-        _ok(offline_keys)
+        # Save key and slot to settings.json at top-level offlineKey
+        key_obj = None
+        loaded = offline_keys.get("loaded", [])
+        if loaded and isinstance(loaded, list):
+            # Take the first loaded key
+            first = loaded[0]
+            key_val = first.get("key")
+            slot_val = first.get("slot")
+            if key_val and slot_val is not None:
+                # Load full file, update top-level offlineKey, save
+                try:
+                    data = json.loads(SETTINGS_PATH.read_text())
+                except Exception:
+                    data = {}
+                data["offlineKey"] = {"key": key_val, "slot": slot_val}
+                SETTINGS_PATH.write_text(json.dumps(data, indent=2))
+                key_obj = {"key": key_val, "slot": slot_val}
+
+        _ok({
+            "offline_keys": offline_keys,
+            "offlineKey_saved": key_obj
+        })
 
 # =================== CLI wiring ===================
 
