@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from aiohttp import ClientSession
+from bleak import BleakScanner
 
 # ----------- resilient yalexs imports (version changes happen) -----------
 try:
@@ -283,6 +284,279 @@ async def cmd_status(args):
         st_data = _to_jsonable(st)
         _ok(st_data)
 
+async def cmd_status_ble(args):
+    """
+    Get just Door and Lock state via BLE using yalexs_ble.
+    Requires offlineKey in settings.json with fields:
+      - key (hex string)
+      - slot (int)
+      - serial (string)
+    """
+    # --- Load offline key (key, slot, serial) ---
+    try:
+        data = json.loads(SETTINGS_PATH.read_text())
+        offline_key = data.get("offlineKey") or {}
+        key_hex = offline_key.get("key")
+        key_index = offline_key.get("slot")
+        serial = offline_key.get("serial")
+        if not key_hex or key_index is None:
+            _fail("NO_OFFLINE_KEY", "offlineKey.key or offlineKey.slot missing in settings.json.")
+        if not serial:
+            _fail("NO_SERIAL", "offlineKey.serial missing in settings.json (needed to derive BLE local name).")
+    except FileNotFoundError:
+        _fail("NO_SETTINGS_FILE", "settings.json not found. Run 'offline-keys' first to populate offlineKey.")
+    except Exception as e:
+        _fail("SETTINGS_READ_FAILED", str(e))
+
+    # --- Imports ---
+    try:
+        from bleak import BleakScanner
+        from yalexs_ble import serial_to_local_name
+        from yalexs_ble.lock import Lock
+    except ImportError as e:
+        _fail("BLE_NOT_AVAILABLE", f"Missing dependency: {e}")
+
+    # --- Compute BLE local name from serial ---
+    local_name = serial_to_local_name(serial)
+
+    # --- Scan once to find the device we want (by local_name) ---
+    found_event = asyncio.Event()
+    found_device = None
+
+    def detection_callback(device, advertisement_data):
+        nonlocal found_device
+        if device and device.name == local_name:
+            # We have our target
+            found_device = device
+            found_event.set()
+
+    try:
+        # Bleak 1.x supports passing the callback at construction; filters may be ignored on some backends
+        try:
+            scanner = BleakScanner(
+                detection_callback=detection_callback,
+                filters={"LocalName": local_name},
+            )
+        except TypeError:
+            scanner = BleakScanner(detection_callback=detection_callback)
+
+        await scanner.start()
+        try:
+            await asyncio.wait_for(found_event.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            _fail("LOCK_NOT_FOUND", f"No BLE advertisements for {local_name} within 5s.")
+        finally:
+            await scanner.stop()
+    except Exception as e:
+        _fail("BLE_SCAN_FAILED", f"Scan failed: {e}")
+
+    # --- Callbacks expected by yalexs_ble.Lock ---
+    # Lock.connect() will call this WITH NO ARGS; it must return the BLEDevice
+    def ble_device_callback():
+        return found_device
+
+    # Optional; noop to avoid signature surprises
+    def state_callback(state):
+        return
+
+    # --- Connect and query only what we need ---
+    try:
+        lock = Lock(
+            ble_device_callback=ble_device_callback,
+            keyString=key_hex,          # hex string from settings
+            keyIndex=key_index,         # slot/index (int)
+            name=local_name,            # BLE local name derived from serial
+            state_callback=state_callback,
+        )
+
+        await lock.connect()
+        try:
+            door_state = await lock.door_status()
+            lock_state = await lock.lock_status()
+        finally:
+            await lock.disconnect()
+
+        # Normalize enums to strings
+        door_text = getattr(door_state, "name", str(door_state))
+        lock_text = getattr(lock_state, "name", str(lock_state))
+
+        _ok({"door": door_text, "lock": lock_text})
+
+    except Exception as e:
+        _fail("BLE_STATUS_FAILED", f"Failed to get BLE status: {e}")
+
+async def cmd_lock_ble(args):
+    """
+    Lock the lock via BLE using offlineKey (keyString, keyIndex, and serial) from settings.json.
+    Works cross-platform using yalexs_ble.
+    """
+    # --- Load offline key ---
+    try:
+        data = json.loads(SETTINGS_PATH.read_text())
+        offline_key = data.get("offlineKey")
+        if not offline_key or not offline_key.get("key") or offline_key.get("slot") is None or not offline_key.get("serial"):
+            _fail("NO_OFFLINE_KEY", "No valid offlineKey in settings.json. Run 'offline-keys' first.")
+    except FileNotFoundError:
+        _fail("NO_SETTINGS_FILE", "settings.json not found. Run 'auth seed' and 'offline-keys' first.")
+    except Exception as e:
+        _fail("SETTINGS_READ_FAILED", str(e))
+
+    keyString = offline_key["key"]
+    keyIndex = offline_key["slot"]
+    serial = offline_key["serial"]
+
+    # --- Imports ---
+    try:
+        from bleak import BleakScanner
+        from yalexs_ble import serial_to_local_name
+        from yalexs_ble.lock import Lock
+    except ImportError as e:
+        _fail("BLE_NOT_AVAILABLE", f"Failed to import BLE dependencies: {str(e)}")
+
+    local_name = serial_to_local_name(serial)
+    found_event = asyncio.Event()
+    found_device = None
+
+    # --- Detection callback ---
+    def detection_callback(device, advertisement_data):
+        nonlocal found_device
+        if device and device.name == local_name:
+            found_device = device
+            found_event.set()
+
+    # --- Scan for lock ---
+    try:
+        try:
+            scanner = BleakScanner(
+                detection_callback=detection_callback,
+                filters={"LocalName": local_name},
+            )
+        except TypeError:
+            scanner = BleakScanner(detection_callback=detection_callback)
+
+        await scanner.start()
+        try:
+            await asyncio.wait_for(found_event.wait(), timeout=5)  # 5 sec scan
+        except asyncio.TimeoutError:
+            await scanner.stop()
+            _fail("LOCK_NOT_FOUND", f"No BLE advertisement from {local_name} in range.")
+        finally:
+            await scanner.stop()
+    except Exception as e:
+        _fail("BLE_SCAN_FAILED", f"Failed during BLE scan: {str(e)}")
+
+    # --- Callbacks expected by yalexs_ble.Lock ---
+    def ble_device_callback():
+        return found_device
+
+    def state_callback(state):
+        print(f"Lock state callback: {state}")
+
+    # --- Connect and lock ---
+    try:
+        lock = Lock(
+            ble_device_callback=ble_device_callback,
+            keyString=keyString,
+            keyIndex=keyIndex,
+            name=local_name,
+            state_callback=state_callback,
+        )
+
+        await lock.connect()
+        try:
+            await lock.lock()
+            _ok({"result": "LOCK_COMMAND_SENT"})
+        finally:
+            await lock.disconnect()
+    except Exception as e:
+        _fail("BLE_LOCK_FAILED", f"Failed to lock via BLE: {str(e)}")
+
+async def cmd_unlock_ble(args):
+    """
+    Unlock the lock via BLE using offlineKey (keyString, keyIndex, and serial) from settings.json.
+    Works cross-platform using yalexs_ble.
+    """
+    # --- Load offline key ---
+    try:
+        data = json.loads(SETTINGS_PATH.read_text())
+        offline_key = data.get("offlineKey")
+        if not offline_key or not offline_key.get("key") or offline_key.get("slot") is None or not offline_key.get("serial"):
+            _fail("NO_OFFLINE_KEY", "No valid offlineKey in settings.json. Run 'offline-keys' first.")
+    except FileNotFoundError:
+        _fail("NO_SETTINGS_FILE", "settings.json not found. Run 'auth seed' and 'offline-keys' first.")
+    except Exception as e:
+        _fail("SETTINGS_READ_FAILED", str(e))
+
+    keyString = offline_key["key"]
+    keyIndex = offline_key["slot"]
+    serial = offline_key["serial"]
+
+    # --- Imports ---
+    try:
+        from bleak import BleakScanner
+        from yalexs_ble import serial_to_local_name
+        from yalexs_ble.lock import Lock
+    except ImportError as e:
+        _fail("BLE_NOT_AVAILABLE", f"Failed to import BLE dependencies: {str(e)}")
+
+    local_name = serial_to_local_name(serial)
+    found_event = asyncio.Event()
+    found_device = None
+
+    # --- Detection callback ---
+    def detection_callback(device, advertisement_data):
+        nonlocal found_device
+        if device and device.name == local_name:
+            found_device = device
+            found_event.set()
+
+    # --- Scan for lock ---
+    try:
+        try:
+            scanner = BleakScanner(
+                detection_callback=detection_callback,
+                filters={"LocalName": local_name},
+            )
+        except TypeError:
+            scanner = BleakScanner(detection_callback=detection_callback)
+
+        await scanner.start()
+        try:
+            await asyncio.wait_for(found_event.wait(), timeout=5)  # 5 sec scan
+        except asyncio.TimeoutError:
+            await scanner.stop()
+            _fail("LOCK_NOT_FOUND", f"No BLE advertisement from {local_name} in range.")
+        finally:
+            await scanner.stop()
+    except Exception as e:
+        _fail("BLE_SCAN_FAILED", f"Failed during BLE scan: {str(e)}")
+
+    # --- Callbacks expected by yalexs_ble.Lock ---
+    def ble_device_callback():
+        return found_device
+
+    def state_callback(state):
+        print(f"Lock state callback: {state}")
+
+    # --- Connect and unlock ---
+    try:
+        lock = Lock(
+            ble_device_callback=ble_device_callback,
+            keyString=keyString,
+            keyIndex=keyIndex,
+            name=local_name,
+            state_callback=state_callback,
+        )
+
+        await lock.connect()
+        try:
+            await lock.unlock()
+            _ok({"result": "UNLOCK_COMMAND_SENT"})
+        finally:
+            await lock.disconnect()
+    except Exception as e:
+        _fail("BLE_UNLOCK_FAILED", f"Failed to unlock via BLE: {str(e)}")
+
 async def _do_action(lock_id: str, action: str, brand: Brand, tokens: Tokens):
     async with ClientSession() as session:
         api = ApiAsync(session, timeout=20, brand=brand)
@@ -343,34 +617,49 @@ async def cmd_offline_keys(args):
         if st is None:
             _fail("OFFLINE_KEYS_FAILED", f"No usable method. Last error: {last_err or 'unknown'}")
 
-        # Extract just the offline keys if available
-        offline_keys = None
+        # Convert to JSON-safe dict
         try:
-            data = _to_jsonable(st)
-            offline_keys = data.get("_data", {}).get("OfflineKeys")
-        except Exception:
-            pass
+            data_json = _to_jsonable(st)
+        except Exception as e:
+            _fail("LOCK_DETAIL_PARSE_FAILED", f"Unable to parse lock detail: {str(e)}")
 
+        # Try to extract offline keys
+        offline_keys = data_json.get("_data", {}).get("OfflineKeys")
         if offline_keys is None:
             _fail("NO_OFFLINE_KEYS", "No offline keys found for this lock")
 
-        # Save key and slot to settings.json at top-level offlineKey
+        # Also extract serial if available
+        serial_val = (
+            data_json.get("_data", {}).get("serial")
+            or data_json.get("_data", {}).get("SerialNumber")
+            or data_json.get("_data", {}).get("LockID")
+        )
+        if not serial_val:
+            print(f"No serial found in lock detail; BLE commands may not work without it.")
+
+        # Save key, slot, and serial to settings.json at top-level offlineKey
         key_obj = None
         loaded = offline_keys.get("loaded", [])
         if loaded and isinstance(loaded, list):
-            # Take the first loaded key
             first = loaded[0]
             key_val = first.get("key")
             slot_val = first.get("slot")
             if key_val and slot_val is not None:
-                # Load full file, update top-level offlineKey, save
                 try:
-                    data = json.loads(SETTINGS_PATH.read_text())
+                    settings_data = json.loads(SETTINGS_PATH.read_text())
                 except Exception:
-                    data = {}
-                data["offlineKey"] = {"key": key_val, "slot": slot_val}
-                SETTINGS_PATH.write_text(json.dumps(data, indent=2))
-                key_obj = {"key": key_val, "slot": slot_val}
+                    settings_data = {}
+                settings_data["offlineKey"] = {
+                    "key": key_val,
+                    "slot": slot_val,
+                    "serial": serial_val,
+                }
+                SETTINGS_PATH.write_text(json.dumps(settings_data, indent=2))
+                key_obj = {
+                    "key": key_val,
+                    "slot": slot_val,
+                    "serial": serial_val,
+                }
 
         _ok({
             "offline_keys": offline_keys,
@@ -424,7 +713,21 @@ def _build_parser():
     ok = sub.add_parser("offline-keys", parents=[brand_parent], help="Get offline keys for a lock")
     ok.add_argument("id", help="Lock ID")
     ok.set_defaults(func=cmd_offline_keys)
+
     # -------------------------
+    # BLE status
+    ble_st = sub.add_parser("status-ble", help="Get lock status via BLE")
+    ble_st.set_defaults(func=cmd_status_ble)
+
+    # -------------------------
+    # BLE lock
+    ble_lk = sub.add_parser("lock-ble", help="Lock a lock via BLE")
+    ble_lk.set_defaults(func=cmd_lock_ble)
+
+    # -------------------------
+    # BLE unlock
+    ble_un = sub.add_parser("unlock-ble", help="Unlock a lock via BLE")
+    ble_un.set_defaults(func=cmd_unlock_ble)
 
     return p
 
