@@ -1,0 +1,21 @@
+[project]
+name = "yalexs-cli"
+version = "0.1.0"
+description = "Thin JSON CLI around the yalexs (Yale Home cloud) and yalexs-ble libraries."
+authors = [
+    { name = "Sten Feldman", email = "exile@chamber.ee" }
+]
+requires-python = ">=3.8"
+
+[project.scripts]
+yalexs-cli = "yalexs-cli:main"
+
+[project.dependencies]
+aiohttp = "^3.9"
+yalexs = "^0.7"
+yalexs-ble = "^3.1"
+bleak = "^1.0"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

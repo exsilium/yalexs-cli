@@ -18,6 +18,7 @@ Usage (seed tokens from Home Assistant, then operate):
   ./yalexs-cli.py status-ble [--index <INDEX> | --serial <SERIAL>]
   ./yalexs-cli.py lock-ble [--index <INDEX> | --serial <SERIAL>]
   ./yalexs-cli.py unlock-ble [--index <INDEX> | --serial <SERIAL>]
+  ./yalexs-cli.py passive-ble [--index <INDEX> | --serial <SERIAL>]
 
 Config/Cache files:
   ~/.config/yalexs-cli/settings.json
@@ -625,6 +626,76 @@ async def cmd_unlock_ble(args):
     finally:
         await lock.disconnect()
 
+async def cmd_passive_ble(args):
+    """
+    Passively monitor BLE advertisements for lock/door state changes.
+    No connection is made; minimal impact on battery.
+    """
+
+    offline_key = _select_offline_key(args)
+    serial = offline_key["serial"]
+
+    try:
+        from bleak import BleakScanner
+        from yalexs_ble import serial_to_local_name
+    except ImportError as e:
+        _fail("BLE_NOT_AVAILABLE", f"Missing dependency: {e}")
+
+    local_name = serial_to_local_name(serial)
+    last_state = None
+
+    def parse_states_from_manufacturer_data(mfg_data: dict):
+        for _, payload in mfg_data.items():
+            if not payload or len(payload) < 6:
+                continue
+            lock_byte = payload[4]
+            door_byte = payload[5]
+
+            lock_state_map = {0x03: "UNLOCKED", 0x05: "LOCKED"}
+            door_state_map = {0x01: "OPEN", 0x02: "CLOSED"}
+
+            lock_state = lock_state_map.get(lock_byte, f"UNKNOWN({lock_byte})")
+            door_state = door_state_map.get(door_byte, f"UNKNOWN({door_byte})")
+            return door_state, lock_state
+        return None
+
+    def detection_callback(device, advertisement_data):
+        nonlocal last_state
+        if not device or device.name != local_name:
+            return
+
+        states = parse_states_from_manufacturer_data(advertisement_data.manufacturer_data)
+        if not states:
+            return
+
+        door_state, lock_state = states
+        state_tuple = (door_state, lock_state)
+        if state_tuple != last_state:
+            last_state = state_tuple
+            print(json.dumps({
+                "timestamp": datetime.datetime.now().isoformat(),
+                "door": door_state,
+                "lock": lock_state
+            }, indent=2))
+
+    try:
+        try:
+            scanner = BleakScanner(
+                detection_callback=detection_callback,
+                filters={"LocalName": local_name},
+            )
+        except TypeError:
+            scanner = BleakScanner(detection_callback=detection_callback)
+
+        print(json.dumps({"listening_for": local_name}))
+        await scanner.start()
+        while True:
+            await asyncio.sleep(0.5)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await scanner.stop()
+
 async def _do_action(lock_id: str, action: str, brand: Brand, tokens: Tokens):
     async with ClientSession() as session:
         api = ApiAsync(session, timeout=20, brand=brand)
@@ -799,7 +870,12 @@ def _build_parser():
     ble_un = sub.add_parser("unlock-ble", help="Unlock a lock via BLE")
     ble_un.set_defaults(func=cmd_unlock_ble)
 
-    for ble_cmd in [ble_st, ble_lk, ble_un]:
+    # -------------------------
+    # Passive BLE listener
+    ble_passive = sub.add_parser("passive-ble", help="Passively listen for BLE state changes")
+    ble_passive.set_defaults(func=cmd_passive_ble)
+
+    for ble_cmd in [ble_st, ble_lk, ble_un, ble_passive]:
         ble_cmd.add_argument("--serial", help="Serial number of lock to use from offlineKey array")
         ble_cmd.add_argument("--index", type=int, help="Index in offlineKey array to use (default 0)")
 
