@@ -15,6 +15,10 @@ Usage (seed tokens from Home Assistant, then operate):
   ./yalexs-cli.py unlock <LOCK_ID>
   ./yalexs-cli.py offline-keys --brand YALE_GLOBAL <LOCK_ID>
 
+  ./yalexs-cli.py status-ble [--index <INDEX> | --serial <SERIAL>]
+  ./yalexs-cli.py lock-ble [--index <INDEX> | --serial <SERIAL>]
+  ./yalexs-cli.py unlock-ble [--index <INDEX> | --serial <SERIAL>]
+
 Config/Cache files:
   ~/.config/yalexs-cli/settings.json
 """
@@ -28,13 +32,11 @@ import json
 import os
 import sys
 import time
-import aiohttp
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Optional
 
 from aiohttp import ClientSession
-from bleak import BleakScanner
 
 # ----------- resilient yalexs imports (version changes happen) -----------
 try:
@@ -82,6 +84,26 @@ def _save_settings(d: Dict):
         data = {}
     data["settings"] = d
     SETTINGS_PATH.write_text(json.dumps(data, indent=2))
+
+def _select_offline_key(args):
+    try:
+        data = json.loads(SETTINGS_PATH.read_text())
+        offline_keys = data.get("offlineKey", [])
+        if not offline_keys:
+            _fail("NO_OFFLINE_KEY", "No offlineKey entries in settings.json. Run 'offline-keys' first.")
+        if args.serial:
+            for k in offline_keys:
+                if k.get("serial") == args.serial:
+                    return k
+            _fail("NO_MATCHING_SERIAL", f"No offlineKey entry with serial {args.serial}")
+        idx = args.index if args.index is not None else 0
+        if idx < 0 or idx >= len(offline_keys):
+            _fail("INDEX_OUT_OF_RANGE", f"offlineKey index {idx} out of range.")
+        return offline_keys[idx]
+    except FileNotFoundError:
+        _fail("NO_SETTINGS_FILE", "settings.json not found. Run 'auth seed' and 'offline-keys' first.")
+    except Exception as e:
+        _fail("SETTINGS_READ_FAILED", str(e))
 
 @dataclass
 class Tokens:
@@ -292,21 +314,11 @@ async def cmd_status_ble(args):
       - slot (int)
       - serial (string)
     """
-    # --- Load offline key (key, slot, serial) ---
-    try:
-        data = json.loads(SETTINGS_PATH.read_text())
-        offline_key = data.get("offlineKey") or {}
-        key_hex = offline_key.get("key")
-        key_index = offline_key.get("slot")
-        serial = offline_key.get("serial")
-        if not key_hex or key_index is None:
-            _fail("NO_OFFLINE_KEY", "offlineKey.key or offlineKey.slot missing in settings.json.")
-        if not serial:
-            _fail("NO_SERIAL", "offlineKey.serial missing in settings.json (needed to derive BLE local name).")
-    except FileNotFoundError:
-        _fail("NO_SETTINGS_FILE", "settings.json not found. Run 'offline-keys' first to populate offlineKey.")
-    except Exception as e:
-        _fail("SETTINGS_READ_FAILED", str(e))
+
+    offline_key = _select_offline_key(args)
+    key_hex = offline_key["key"]
+    key_index = offline_key["slot"]
+    serial = offline_key["serial"]
 
     # --- Imports ---
     try:
@@ -390,19 +402,10 @@ async def cmd_lock_ble(args):
     Lock the lock via BLE using offlineKey (keyString, keyIndex, and serial) from settings.json.
     Works cross-platform using yalexs_ble.
     """
-    # --- Load offline key ---
-    try:
-        data = json.loads(SETTINGS_PATH.read_text())
-        offline_key = data.get("offlineKey")
-        if not offline_key or not offline_key.get("key") or offline_key.get("slot") is None or not offline_key.get("serial"):
-            _fail("NO_OFFLINE_KEY", "No valid offlineKey in settings.json. Run 'offline-keys' first.")
-    except FileNotFoundError:
-        _fail("NO_SETTINGS_FILE", "settings.json not found. Run 'auth seed' and 'offline-keys' first.")
-    except Exception as e:
-        _fail("SETTINGS_READ_FAILED", str(e))
 
-    keyString = offline_key["key"]
-    keyIndex = offline_key["slot"]
+    offline_key = _select_offline_key(args)
+    key_hex = offline_key["key"]
+    key_index = offline_key["slot"]
     serial = offline_key["serial"]
 
     # --- Imports ---
@@ -456,8 +459,8 @@ async def cmd_lock_ble(args):
     try:
         lock = Lock(
             ble_device_callback=ble_device_callback,
-            keyString=keyString,
-            keyIndex=keyIndex,
+            keyString=key_hex,
+            keyIndex=key_index,
             name=local_name,
             state_callback=state_callback,
         )
@@ -476,17 +479,8 @@ async def cmd_unlock_ble(args):
     Unlock the lock via BLE using offlineKey (keyString, keyIndex, and serial) from settings.json.
     Works cross-platform using yalexs_ble.
     """
-    # --- Load offline key ---
-    try:
-        data = json.loads(SETTINGS_PATH.read_text())
-        offline_key = data.get("offlineKey")
-        if not offline_key or not offline_key.get("key") or offline_key.get("slot") is None or not offline_key.get("serial"):
-            _fail("NO_OFFLINE_KEY", "No valid offlineKey in settings.json. Run 'offline-keys' first.")
-    except FileNotFoundError:
-        _fail("NO_SETTINGS_FILE", "settings.json not found. Run 'auth seed' and 'offline-keys' first.")
-    except Exception as e:
-        _fail("SETTINGS_READ_FAILED", str(e))
 
+    offline_key = _select_offline_key(args)
     keyString = offline_key["key"]
     keyIndex = offline_key["slot"]
     serial = offline_key["serial"]
@@ -637,7 +631,7 @@ async def cmd_offline_keys(args):
         if not serial_val:
             print(f"No serial found in lock detail; BLE commands may not work without it.")
 
-        # Save key, slot, and serial to settings.json at top-level offlineKey
+        # Save key, slot, and serial to settings.json at top-level offlineKey (now an array)
         key_obj = None
         loaded = offline_keys.get("loaded", [])
         if loaded and isinstance(loaded, list):
@@ -649,17 +643,19 @@ async def cmd_offline_keys(args):
                     settings_data = json.loads(SETTINGS_PATH.read_text())
                 except Exception:
                     settings_data = {}
-                settings_data["offlineKey"] = {
+                offline_keys_arr = settings_data.get("offlineKey", [])
+                # Remove any with same serial
+                offline_keys_arr = [k for k in offline_keys_arr if k.get("serial") != serial_val]
+                # Add new
+                new_entry = {
                     "key": key_val,
                     "slot": slot_val,
                     "serial": serial_val,
                 }
+                offline_keys_arr.append(new_entry)
+                settings_data["offlineKey"] = offline_keys_arr
                 SETTINGS_PATH.write_text(json.dumps(settings_data, indent=2))
-                key_obj = {
-                    "key": key_val,
-                    "slot": slot_val,
-                    "serial": serial_val,
-                }
+                key_obj = new_entry
 
         _ok({
             "offline_keys": offline_keys,
@@ -728,6 +724,10 @@ def _build_parser():
     # BLE unlock
     ble_un = sub.add_parser("unlock-ble", help="Unlock a lock via BLE")
     ble_un.set_defaults(func=cmd_unlock_ble)
+
+    for ble_cmd in [ble_st, ble_lk, ble_un]:
+        ble_cmd.add_argument("--serial", help="Serial number of lock to use from offlineKey array")
+        ble_cmd.add_argument("--index", type=int, help="Index in offlineKey array to use (default 0)")
 
     return p
 
