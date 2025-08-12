@@ -152,6 +152,41 @@ def _default_settings() -> Dict:
         # "client_id": "...",  # Optional, can be set later
     }
 
+from datetime import datetime, timezone, timedelta
+
+STALE_AFTER = timedelta(minutes=30)
+
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _is_fresh(last_seen_iso: str) -> bool:
+    try:
+        last = datetime.fromisoformat(last_seen_iso)
+        return datetime.now(timezone.utc) - last < STALE_AFTER
+    except Exception:
+        return False
+
+def _cache_ble_address(serial: str, address: str) -> None:
+    """Update/insert address + last_seen for the matching offlineKey entry."""
+    try:
+        data = json.loads(SETTINGS_PATH.read_text())
+    except Exception:
+        data = {}
+    arr = data.get("offlineKey", [])
+    changed = False
+    for k in arr:
+        if k.get("serial") == serial:
+            if k.get("address") != address:
+                k["address"] = address
+            k["last_seen"] = _now_utc_iso()
+            changed = True
+            break
+    if not changed:
+        # If entry not found (shouldn't happen if you selected it), create minimal one
+        arr.append({"serial": serial, "address": address, "last_seen": _now_utc_iso()})
+    data["offlineKey"] = arr
+    SETTINGS_PATH.write_text(json.dumps(data, indent=2))
+
 # =================== Auth commands ===================
 
 async def cmd_auth_seed(args):
@@ -314,11 +349,12 @@ async def cmd_status_ble(args):
       - slot (int)
       - serial (string)
     """
-
     offline_key = _select_offline_key(args)
     key_hex = offline_key["key"]
     key_index = offline_key["slot"]
     serial = offline_key["serial"]
+    cached_addr = offline_key.get("address")
+    last_seen = offline_key.get("last_seen")
 
     # --- Imports ---
     try:
@@ -328,87 +364,97 @@ async def cmd_status_ble(args):
     except ImportError as e:
         _fail("BLE_NOT_AVAILABLE", f"Missing dependency: {e}")
 
-    # --- Compute BLE local name from serial ---
     local_name = serial_to_local_name(serial)
 
-    # --- Scan once to find the device we want (by local_name) ---
-    found_event = asyncio.Event()
-    found_device = None
-
-    def detection_callback(device, advertisement_data):
-        nonlocal found_device
-        if device and device.name == local_name:
-            # We have our target
-            found_device = device
-            found_event.set()
-
-    try:
-        # Bleak 1.x supports passing the callback at construction; filters may be ignored on some backends
-        try:
-            scanner = BleakScanner(
-                detection_callback=detection_callback,
-                filters={"LocalName": local_name},
-            )
-        except TypeError:
-            scanner = BleakScanner(detection_callback=detection_callback)
-
-        await scanner.start()
-        try:
-            await asyncio.wait_for(found_event.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            _fail("LOCK_NOT_FOUND", f"No BLE advertisements for {local_name} within 5s.")
-        finally:
-            await scanner.stop()
-    except Exception as e:
-        _fail("BLE_SCAN_FAILED", f"Scan failed: {e}")
-
-    # --- Callbacks expected by yalexs_ble.Lock ---
-    # Lock.connect() will call this WITH NO ARGS; it must return the BLEDevice
+    found_device = None  # set if we scan
     def ble_device_callback():
-        return found_device
+        # If we scanned this run, return BLEDevice. Else return cached address if fresh.
+        if found_device is not None:
+            return found_device
+        if cached_addr and last_seen and _is_fresh(last_seen):
+            return cached_addr  # Lock.connect can take a str address
+        return None  # forces scan fallback below if connect fails
 
-    # Optional; noop to avoid signature surprises
     def state_callback(state):
         return
 
-    # --- Connect and query only what we need ---
+    # Try direct connect (uses cached address if fresh)
+    lock = Lock(
+        ble_device_callback=ble_device_callback,
+        keyString=key_hex,
+        keyIndex=key_index,
+        name=local_name,
+        state_callback=state_callback,
+    )
+
+    connected = False
     try:
-        lock = Lock(
-            ble_device_callback=ble_device_callback,
-            keyString=key_hex,          # hex string from settings
-            keyIndex=key_index,         # slot/index (int)
-            name=local_name,            # BLE local name derived from serial
-            state_callback=state_callback,
-        )
+        if cached_addr and last_seen and _is_fresh(last_seen):
+            await lock.connect()
+            connected = True
+    except Exception:
+        # Fall back to scan
+        connected = False
 
-        await lock.connect()
+    # If not connected, do a short scan to resolve current address
+    if not connected:
+        found_event = asyncio.Event()
+
+        def detection_callback(device, advertisement_data):
+            nonlocal found_device
+            if device and device.name == local_name:
+                found_device = device
+                found_event.set()
+
         try:
-            door_state = await lock.door_status()
-            lock_state = await lock.lock_status()
-        finally:
-            await lock.disconnect()
+            try:
+                scanner = BleakScanner(
+                    detection_callback=detection_callback,
+                    filters={"LocalName": local_name},
+                )
+            except TypeError:
+                scanner = BleakScanner(detection_callback=detection_callback)
 
-        # Normalize enums to strings
-        door_text = getattr(door_state, "name", str(door_state))
-        lock_text = getattr(lock_state, "name", str(lock_state))
+            await scanner.start()
+            try:
+                await asyncio.wait_for(found_event.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                await scanner.stop()
+                _fail("LOCK_NOT_FOUND", f"No BLE advertisements for {local_name} within 5s.")
+            finally:
+                await scanner.stop()
+        except Exception as e:
+            _fail("BLE_SCAN_FAILED", f"Scan failed: {e}")
 
-        _ok({"door": door_text, "lock": lock_text})
+        # Cache updated address for next time
+        if found_device and getattr(found_device, "address", None):
+            _cache_ble_address(serial, found_device.address)
 
-    except Exception as e:
-        _fail("BLE_STATUS_FAILED", f"Failed to get BLE status: {e}")
+        # Connect now that we have a device
+        await lock.connect()
+
+    try:
+        door_state = await lock.door_status()
+        lock_state = await lock.lock_status()
+    finally:
+        await lock.disconnect()
+
+    door_text = getattr(door_state, "name", str(door_state))
+    lock_text = getattr(lock_state, "name", str(lock_state))
+    _ok({"door": door_text, "lock": lock_text})
 
 async def cmd_lock_ble(args):
     """
-    Lock the lock via BLE using offlineKey (keyString, keyIndex, and serial) from settings.json.
-    Works cross-platform using yalexs_ble.
+    Lock the lock via BLE using offlineKey (key, slot, serial) from settings.json.
+    Uses cached BLE address when fresh; otherwise falls back to a short scan.
     """
-
     offline_key = _select_offline_key(args)
     key_hex = offline_key["key"]
     key_index = offline_key["slot"]
     serial = offline_key["serial"]
+    cached_addr = offline_key.get("address")
+    last_seen = offline_key.get("last_seen")
 
-    # --- Imports ---
     try:
         from bleak import BleakScanner
         from yalexs_ble import serial_to_local_name
@@ -417,75 +463,89 @@ async def cmd_lock_ble(args):
         _fail("BLE_NOT_AVAILABLE", f"Failed to import BLE dependencies: {str(e)}")
 
     local_name = serial_to_local_name(serial)
-    found_event = asyncio.Event()
     found_device = None
 
-    # --- Detection callback ---
-    def detection_callback(device, advertisement_data):
-        nonlocal found_device
-        if device and device.name == local_name:
-            found_device = device
-            found_event.set()
-
-    # --- Scan for lock ---
-    try:
-        try:
-            scanner = BleakScanner(
-                detection_callback=detection_callback,
-                filters={"LocalName": local_name},
-            )
-        except TypeError:
-            scanner = BleakScanner(detection_callback=detection_callback)
-
-        await scanner.start()
-        try:
-            await asyncio.wait_for(found_event.wait(), timeout=5)  # 5 sec scan
-        except asyncio.TimeoutError:
-            await scanner.stop()
-            _fail("LOCK_NOT_FOUND", f"No BLE advertisement from {local_name} in range.")
-        finally:
-            await scanner.stop()
-    except Exception as e:
-        _fail("BLE_SCAN_FAILED", f"Failed during BLE scan: {str(e)}")
-
-    # --- Callbacks expected by yalexs_ble.Lock ---
     def ble_device_callback():
-        return found_device
+        if found_device is not None:
+            return found_device
+        if cached_addr and last_seen and _is_fresh(last_seen):
+            return cached_addr
+        return None
 
     def state_callback(state):
-        print(f"Lock state callback: {state}")
+        # Optional: print(f"Lock state callback: {state}")
+        return
 
-    # --- Connect and lock ---
+    lock = Lock(
+        ble_device_callback=ble_device_callback,
+        keyString=key_hex,
+        keyIndex=key_index,
+        name=local_name,
+        state_callback=state_callback,
+    )
+
+    connected = False
     try:
-        lock = Lock(
-            ble_device_callback=ble_device_callback,
-            keyString=key_hex,
-            keyIndex=key_index,
-            name=local_name,
-            state_callback=state_callback,
-        )
+        if cached_addr and last_seen and _is_fresh(last_seen):
+            await lock.connect()
+            connected = True
+    except Exception:
+        connected = False
+
+    if not connected:
+        found_event = asyncio.Event()
+
+        def detection_callback(device, advertisement_data):
+            nonlocal found_device
+            if device and device.name == local_name:
+                found_device = device
+                found_event.set()
+
+        try:
+            try:
+                scanner = BleakScanner(
+                    detection_callback=detection_callback,
+                    filters={"LocalName": local_name},
+                )
+            except TypeError:
+                scanner = BleakScanner(detection_callback=detection_callback)
+
+            await scanner.start()
+            try:
+                await asyncio.wait_for(found_event.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                await scanner.stop()
+                _fail("LOCK_NOT_FOUND", f"No BLE advertisement from {local_name} in range.")
+            finally:
+                await scanner.stop()
+        except Exception as e:
+            _fail("BLE_SCAN_FAILED", f"Failed during BLE scan: {str(e)}")
+
+        if found_device and getattr(found_device, "address", None):
+            _cache_ble_address(serial, found_device.address)
 
         await lock.connect()
-        try:
-            await lock.lock()
-            _ok({"result": "LOCK_COMMAND_SENT"})
-        finally:
-            await lock.disconnect()
+
+    try:
+        await lock.lock()
+        _ok({"result": "LOCK_COMMAND_SENT"})
     except Exception as e:
         _fail("BLE_LOCK_FAILED", f"Failed to lock via BLE: {str(e)}")
+    finally:
+        await lock.disconnect()
 
 async def cmd_unlock_ble(args):
     """
-    Unlock the lock via BLE using offlineKey (keyString, keyIndex, and serial) from settings.json.
-    Works cross-platform using yalexs_ble.
+    Unlock the lock via BLE using offlineKey (key, slot, serial) from settings.json.
+    Uses cached BLE address when fresh; otherwise falls back to a short scan.
     """
-
     offline_key = _select_offline_key(args)
-    keyString = offline_key["key"]
-    keyIndex = offline_key["slot"]
+    key_hex = offline_key["key"]
+    key_index = offline_key["slot"]
     serial = offline_key["serial"]
+    cached_addr = offline_key.get("address")
+    last_seen = offline_key.get("last_seen")
 
-    # --- Imports ---
     try:
         from bleak import BleakScanner
         from yalexs_ble import serial_to_local_name
@@ -494,62 +554,76 @@ async def cmd_unlock_ble(args):
         _fail("BLE_NOT_AVAILABLE", f"Failed to import BLE dependencies: {str(e)}")
 
     local_name = serial_to_local_name(serial)
-    found_event = asyncio.Event()
     found_device = None
 
-    # --- Detection callback ---
-    def detection_callback(device, advertisement_data):
-        nonlocal found_device
-        if device and device.name == local_name:
-            found_device = device
-            found_event.set()
-
-    # --- Scan for lock ---
-    try:
-        try:
-            scanner = BleakScanner(
-                detection_callback=detection_callback,
-                filters={"LocalName": local_name},
-            )
-        except TypeError:
-            scanner = BleakScanner(detection_callback=detection_callback)
-
-        await scanner.start()
-        try:
-            await asyncio.wait_for(found_event.wait(), timeout=5)  # 5 sec scan
-        except asyncio.TimeoutError:
-            await scanner.stop()
-            _fail("LOCK_NOT_FOUND", f"No BLE advertisement from {local_name} in range.")
-        finally:
-            await scanner.stop()
-    except Exception as e:
-        _fail("BLE_SCAN_FAILED", f"Failed during BLE scan: {str(e)}")
-
-    # --- Callbacks expected by yalexs_ble.Lock ---
     def ble_device_callback():
-        return found_device
+        if found_device is not None:
+            return found_device
+        if cached_addr and last_seen and _is_fresh(last_seen):
+            return cached_addr
+        return None
 
     def state_callback(state):
-        print(f"Lock state callback: {state}")
+        # Optional: print(f"Lock state callback: {state}")
+        return
 
-    # --- Connect and unlock ---
+    lock = Lock(
+        ble_device_callback=ble_device_callback,
+        keyString=key_hex,
+        keyIndex=key_index,
+        name=local_name,
+        state_callback=state_callback,
+    )
+
+    connected = False
     try:
-        lock = Lock(
-            ble_device_callback=ble_device_callback,
-            keyString=keyString,
-            keyIndex=keyIndex,
-            name=local_name,
-            state_callback=state_callback,
-        )
+        if cached_addr and last_seen and _is_fresh(last_seen):
+            await lock.connect()
+            connected = True
+    except Exception:
+        connected = False
+
+    if not connected:
+        found_event = asyncio.Event()
+
+        def detection_callback(device, advertisement_data):
+            nonlocal found_device
+            if device and device.name == local_name:
+                found_device = device
+                found_event.set()
+
+        try:
+            try:
+                scanner = BleakScanner(
+                    detection_callback=detection_callback,
+                    filters={"LocalName": local_name},
+                )
+            except TypeError:
+                scanner = BleakScanner(detection_callback=detection_callback)
+
+            await scanner.start()
+            try:
+                await asyncio.wait_for(found_event.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                await scanner.stop()
+                _fail("LOCK_NOT_FOUND", f"No BLE advertisement from {local_name} in range.")
+            finally:
+                await scanner.stop()
+        except Exception as e:
+            _fail("BLE_SCAN_FAILED", f"Failed during BLE scan: {str(e)}")
+
+        if found_device and getattr(found_device, "address", None):
+            _cache_ble_address(serial, found_device.address)
 
         await lock.connect()
-        try:
-            await lock.unlock()
-            _ok({"result": "UNLOCK_COMMAND_SENT"})
-        finally:
-            await lock.disconnect()
+
+    try:
+        await lock.unlock()
+        _ok({"result": "UNLOCK_COMMAND_SENT"})
     except Exception as e:
         _fail("BLE_UNLOCK_FAILED", f"Failed to unlock via BLE: {str(e)}")
+    finally:
+        await lock.disconnect()
 
 async def _do_action(lock_id: str, action: str, brand: Brand, tokens: Tokens):
     async with ClientSession() as session:
